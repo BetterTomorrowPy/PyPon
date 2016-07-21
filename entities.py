@@ -5,8 +5,7 @@ import hashlib
 from datetime import datetime
 from pony.orm import *
 
-db = Database()
-
+from bootloader import db
 
 class User(db.Entity):
     _table_ = 'users'

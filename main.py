@@ -2,39 +2,31 @@
 """"""
 import os
 import json
-import logging
 
 from hashlib import md5
 from tornado import web, gen, ioloop
-from jinja2 import Environment, FileSystemLoader
 from sockjs.tornado import SockJSRouter, SockJSConnection
-from pony.orm import sql_debug
+from pony.orm import sql_debug, db_session
 
 from entities import *
-
-logging.getLogger().setLevel(logging.INFO)
-logger = logging.getLogger('photo')
-
-sql_debug(True)
-
-template_env = Environment(loader=FileSystemLoader(searchpath="templates"))
-db.generate_mapping(create_tables=True)
-
-TORNADO_PORT = 8080
-
-ws_router = None
-connections = set()
+from bootloader import *
 
 
 class BaseHandler(web.RequestHandler):
     """"""
     def get_current_user(self):
-        return self.get_secure_cookie('username')
+        user = self.get_secure_cookie('username')
+        if isinstance(user, str):
+            return user
+        elif isinstance(user, bytes):
+            return user.decode('utf-8')
+        else:
+            return None
 
     def render(self, file_name, **kwargs):
         template = template_env.get_template(file_name)
         kwargs.update({
-            'TORNADO_PORT': TORNADO_PORT,
+            'TORNADO_PORT': 8080,
             'current_user': self.current_user
         })
         self.write(template.render(**kwargs))
@@ -61,8 +53,8 @@ class LoginHandler(BaseHandler):
     def post(self):
         username = self.get_argument('username', '')
         password = self.get_argument('password', '')
-        user = User.get(username=username, password=User.check_password(password))
-        if user:
+        user = User.get(username=username)
+        if user and user.check_password(password):
             self.set_secure_cookie('username', username)
             self.redirect('/user/%s' % username)
             return
@@ -75,6 +67,7 @@ class SignupHandler(BaseHandler):
         self.render('signup.html')
 
     @gen.coroutine
+    @db_session
     def post(self):
         username = self.get_argument('username', '')
         password = self.get_argument('password', '')
@@ -97,65 +90,84 @@ class LogoutHandler(BaseHandler):
 
 
 class UserHomeHandler(BaseHandler):
-    @gen.coroutine
-    @db_session
-    def get(self, username):
-        user = User.get(username=username)
-        if not user:
-            raise web.HTTPError(404, 'No such user.')
-        photos = select(p for p in Photo if p.user.username == username)
-        self.render('photos.html', page_owner=username, photos=photos)
+    def get(self, username=''):
+        # username = self.get_argument('username', '')
+        with db_session:
+            user = User.get(username=username)
+            if not user:
+                raise web.HTTPError(404, 'No such user.')
+            photos = select(p for p in Photo if p.user.username == username)
+            self.render('photos.html', page_owner=username, photos=photos)
 
 
 class UploadHandler(BaseHandler):
-    @gen.coroutine
     @web.authenticated
-    @gen.coroutine
     def get(self):
         self.render('upload.html')
 
-    # -----------
-
+    @gen.coroutine
     @web.authenticated
     @db_session
     def post(self):
+        """"""
         if 'photo_file' not in self.request.files:
             self.render('upload.html')
             return
+
         photo_file = self.request.files['photo_file'][0]
         content = photo_file['body']
         extension = os.path.splitext(photo_file['filename'])[1]
-        filename = "photos/%s%s" % (md5(content).hexdigest(), extension)
+        filename = 'photos/%s%s' % (md5(content).hexdigest(), extension)
         if not os.path.exists(filename):
             with open(filename, 'wb') as f:
                 f.write(content)
         photo_url = '/%s' % filename
         user = User.get(username=self.current_user)
         photo = Photo(user=user, filename=filename, photo_url=photo_url)
-        commit()
-        self.broadcast({'event': 'new_photo',
-                        'data': {'id': photo.id, 'photo_url': photo_url, 'username': self.current_user,
-                                 'likes_count': 0, 'liked': False}})
+        self.broadcast({
+                'event': 'new_photo',
+                'data': {
+                    'id': photo.id,
+                    'photo_url':photo_url,
+                    'username': self.current_user,
+                    'likes_count': 0,
+                    'liked': False
+                }
+            })
         self.redirect('/')
 
 
 class LikeHandler(BaseHandler):
+    """"""
+    @gen.coroutine
     @db_session
     def post(self):
         if not self.current_user:
+            self.redirect('/login')
             return
         user = User.get(username=self.current_user)
         photo_id = self.get_argument('photo_id')
         username = self.get_argument('username')
         photo = Photo[photo_id]
         like = Like.get(user=user, photo=photo)
-        if like is None:
-            Like(user=user, photo=photo)
-            self.broadcast({'event': 'like', 'data': {'photo_id': photo_id, 'username': username}})
-        else:
+        if like:
             like.delete()
-            self.broadcast({'event': 'unlike', 'data': {'photo_id': photo_id, 'username': username}})
-
+            self.broadcast({
+                    'event': 'unlike',
+                    'data': {
+                        'photo_id': photo_id,
+                        'username': username
+                    }
+                })
+        else:
+            Like(user=user, photo=photo)
+            self.broadcast({
+                        'event': 'like',
+                        'data': {
+                            'photo_id': photo_id,
+                            'username': username
+                        }
+                    })
 
 class WSConnection(SockJSConnection):
     def on_open(self, request):
@@ -188,6 +200,10 @@ class WSConnection(SockJSConnection):
         self.send({'event': 'photo_list', 'data': data})
 
 if __name__ == "__main__":
+    # sql_debug(True)
+    db.bind('sqlite', 'basedb.sqlite', create_db=True)
+    db.generate_mapping(create_tables=True)
+
     ws_router = SockJSRouter(WSConnection, '/ws')
     app = web.Application(
         [
@@ -195,7 +211,7 @@ if __name__ == "__main__":
             (r"/login", LoginHandler),
             (r"/signup", SignupHandler),
             (r"/logout", LogoutHandler),
-            (r"/user/(\w+)", UserHomeHandler),
+            (r"/user/(.*)", UserHomeHandler),
             (r"/upload", UploadHandler),
             (r"/photos/(.*)", web.StaticFileHandler, {'path': 'photos/'}),
             (r"/fonts/(.*)", web.StaticFileHandler, {'path': 'static/fonts'}),
@@ -206,6 +222,6 @@ if __name__ == "__main__":
         static_path=os.path.join(os.path.dirname(__file__), "static"),
         debug=True
     )
-    app.listen(TORNADO_PORT)
-    logger.info("application started, go to http://localhost:{port}".format(**{'port': TORNADO_PORT}))
+    app.listen(8080)
+    logger.info("application started, go to http://localhost:{port}".format(**{'port': 8080}))
     ioloop.IOLoop.instance().start()
